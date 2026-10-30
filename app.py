@@ -8,28 +8,17 @@ import shutil
 import subprocess
 from typing import List, Optional, Dict, Any
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor
-
-import glob
-from xml.etree import ElementTree as ET
+from urllib.parse import urlparse, urljoin
 
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 import yt_dlp
-
-try:
-    from pywidevine.cdm import Cdm
-    from pywidevine.device import Device
-    from pywidevine.pssh import PSSH
-    WIDEVINE_ENABLED = True
-except ImportError:
-    WIDEVINE_ENABLED = False
 
 from contextlib import asynccontextmanager
 
@@ -72,7 +61,7 @@ async def auto_clean_downloads_loop():
     """
     Background worker running every 60 seconds.
     Automatically deletes files from DOWNLOADS_DIR:
-    1) If uploaded to YouTube: deleted exactly 1 hour (3600s) after upload completes.
+    1) If uploaded to YouTube or Telegram: deleted exactly 1 hour (3600s) after latest upload completes.
     2) If not uploaded: deleted 1 hour after download completes / file creation.
     Never deletes files while upload is actively in progress.
     Keeps the YouTube watch link & task entry intact in UI while reclaiming 100% disk space.
@@ -228,7 +217,6 @@ except Exception as e:
     TG_IMPORT_ERROR = str(e)
 
 
-
 # --- Models ---
 class SingleDownloadRequest(BaseModel):
     url: str
@@ -242,7 +230,6 @@ class SingleDownloadRequest(BaseModel):
     tg_api_id: Optional[str] = None
     tg_api_hash: Optional[str] = None
     tg_chat_id: Optional[str] = None
-    keys: Optional[List[str]] = None
 
 
 class BatchItemRequest(BaseModel):
@@ -334,7 +321,7 @@ def get_mps_and_keys(api_url: str) -> tuple:
 def parse_m3u8_variant(master_url: str, m3u8_text: str, target_res: Optional[str] = None) -> Optional[str]:
     """
     Parses multi-variant HLS master playlist (master.m3u8) to select the best stream
-    matching the target resolution (or highest quality), preserving Akamai tokens (hdnts/hdntl/key).
+    matching the target resolution (or highest quality), preserving query parameters (edge-cache-token).
     """
     try:
         lines = [line.strip() for line in m3u8_text.splitlines() if line.strip()]
@@ -353,7 +340,7 @@ def parse_m3u8_variant(master_url: str, m3u8_text: str, target_res: Optional[str
                 parsed_master = urlparse(master_url)
                 parsed_variant = urlparse(full_uri)
 
-                # Ensure query string from master_url (hdnts, key, userIds) is retained
+                # Ensure query string from master_url (edge-cache-token, etc.) is retained
                 if parsed_master.query and not parsed_variant.query:
                     full_uri = f"{full_uri}?{parsed_master.query}"
                 elif parsed_master.query and parsed_variant.query and parsed_master.query not in parsed_variant.query:
@@ -388,9 +375,9 @@ def parse_m3u8_variant(master_url: str, m3u8_text: str, target_res: Optional[str
         return None
 
 
-def resolve_media_url(url: str, requested_resolution: Optional[str] = None) -> Dict[str, Any]:
+def resolve_media_url(url: str, requested_resolution: Optional[str] = "720") -> Dict[str, Any]:
     """
-    Resolves ClassPlus, Akamai (L1/L2), Testbook, CloudFront Live Classes, and DRM URLs before downloading.
+    Resolves ClassPlus, Akamai (L1/L2), ClassX (Google Edge Cache), Testbook, and DRM URLs before downloading.
     """
     base_url = url.strip()
     resolved_url = base_url
@@ -425,96 +412,60 @@ def resolve_media_url(url: str, requested_resolution: Optional[str] = None) -> D
             resolved_url = resolved_url.split('*')[0]
         media_type = "AppX Encrypted"
 
-    # 4. CloudFront / Live Classes / Timeshift HLS Stream (e.g. liveclasses.cloud-front.in)
-    elif any(k in resolved_url.lower() for k in ["cloud-front.in", "liveclasses", "timeshift=1", "txcodectempname", "starttime_epoch"]):
-        media_type = "CloudFront / Live Timeshift"
-        try:
-            parsed = urlparse(resolved_url)
-            origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "https://liveclasses.cloud-front.in"
-        except Exception:
-            origin = "https://liveclasses.cloud-front.in"
+    # ============================================================
+    #  🔥 ClassX (Google Edge Cache Signed HLS Streams)
+    # ============================================================
+    elif any(k in resolved_url.lower() for k in ["classx.co.in", "transcoded-videos.classx"]):
+        media_type = "ClassX Stream"
 
-        extra_headers['Referer'] = f"{origin}/"
-        extra_headers['Origin'] = origin
+        # Extract tenant name from path /videos/{tenant}-data/...
+        m_tenant = re.search(r'/videos/([a-zA-Z0-9_\-]+?)(?:-data)?/', resolved_url)
+        tenant_name = m_tenant.group(1) if m_tenant else "web"
+
+        # Auto-determine Referer & Origin for tenant
+        auto_referer = f"https://{tenant_name}.classx.co.in/"
+        auto_origin = f"https://{tenant_name}.classx.co.in"
+
         extra_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        extra_headers['Referer'] = auto_referer
+        extra_headers['Origin'] = auto_origin
         extra_headers['Accept'] = '*/*'
         extra_headers['Accept-Encoding'] = 'gzip, deflate, br'
         extra_headers['Sec-Fetch-Mode'] = 'cors'
         extra_headers['Sec-Fetch-Site'] = 'cross-site'
         extra_headers['Sec-Fetch-Dest'] = 'empty'
 
-        # Adapt txCodecTempName to requested resolution if present
-        if requested_resolution and "txCodecTempName=" in resolved_url:
-            res_val = str(requested_resolution).strip().lower()
-            if res_val in ["360", "480", "720", "1080"]:
-                test_url = re.sub(r'txCodecTempName=[^&]+', f'txCodecTempName={res_val}p', resolved_url)
-                try:
-                    head_res = requests.head(test_url, headers=extra_headers, timeout=3, allow_redirects=True)
-                    if head_res.status_code == 200:
-                        resolved_url = test_url
-                        logger.info(f"✅ Adapted stream resolution to {res_val}p")
-                except Exception:
-                    pass
-
-    # ============================================================
-    #  🔥 FIXED: ClassPlus / Akamai Logic (L1 + L2 + Direct HLS)
-    # ============================================================
-    elif ('classplusapp' in resolved_url or "testbook.com" in resolved_url or 
-          "classplusapp.com/drm" in resolved_url or "media-cdn.classplusapp.com/drm" in resolved_url or 
-          "akamai-cdn.classplusapp.com" in resolved_url or "hdnts=" in resolved_url or "hdntl=" in resolved_url):
-        
-        media_type = "ClassPlus / Akamai"
-
-        # Extract Akamai token (hdnts or hdntl)
-        m_hdnts = re.search(r'[?&](hdnt[sl]=[^&]+)', resolved_url)
-        hdnts_token = m_hdnts.group(1) if m_hdnts else ""
-
-        # Check L1 / L2
-        is_l1 = 'key=' in resolved_url and 'userIds=' in resolved_url
-        is_l2 = bool(hdnts_token) and not is_l1
-
-        if is_l1:
-            logger.info("✅ L1 link detected (key + userIds) — preserving all parameters")
-            media_type = "ClassPlus Akamai (L1)"
-        elif is_l2:
-            logger.info("✅ L2 Akamai HLS link detected (hdnts token)")
-            media_type = "ClassPlus Akamai (L2)"
-        else:
-            logger.info("ℹ️ Standard / direct ClassPlus link")
-
-        # Standard headers for ClassPlus & Akamai CDN EdgeAuth
-        extra_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        extra_headers['Referer'] = 'https://web.classplusapp.com/'
-        extra_headers['Origin'] = 'https://web.classplusapp.com'
-        extra_headers['Accept'] = '*/*'
-        extra_headers['Accept-Encoding'] = 'gzip, deflate, br'
-        extra_headers['Accept-Language'] = 'en-US,en;q=0.9'
-        extra_headers['Sec-Fetch-Mode'] = 'cors'
-        extra_headers['Sec-Fetch-Site'] = 'cross-site'
-        extra_headers['Sec-Fetch-Dest'] = 'empty'
-        extra_headers['x-cdn-tag'] = 'empty'
-        if hdnts_token:
-            extra_headers['Cookie'] = hdnts_token
-
-        # Check if URL is ALREADY a direct Akamai/ClassPlus HLS stream (.m3u8)
+        # Parse multi-variant if m3u8
         if ".m3u8" in resolved_url:
-            logger.info("🎯 Direct Akamai / ClassPlus HLS stream detected, checking multi-variant resolution...")
+            logger.info("🎯 ClassX HLS stream detected, checking multi-variant resolution...")
             try:
-                resp = requests.get(resolved_url, headers=extra_headers, timeout=5)
+                resp = requests.get(resolved_url, headers=extra_headers, timeout=6)
+                if resp.status_code in [403, 404]:
+                    # Fallback to transcoded-videos.classx.co.in if tenant subdomain was strictly restricted
+                    fallback_headers = extra_headers.copy()
+                    fallback_headers['Referer'] = "https://transcoded-videos.classx.co.in/"
+                    fallback_headers['Origin'] = "https://transcoded-videos.classx.co.in"
+                    fb_resp = requests.get(resolved_url, headers=fallback_headers, timeout=6)
+                    if fb_resp.status_code == 200:
+                        extra_headers.update(fallback_headers)
+                        resp = fb_resp
+
                 if resp.status_code == 200 and "#EXT-X-STREAM-INF" in resp.text:
                     variant_url = parse_m3u8_variant(resolved_url, resp.text, requested_resolution or "720")
                     if variant_url:
                         resolved_url = variant_url
-                        logger.info(f"✅ Selected variant stream URL: {resolved_url[:80]}...")
+                        logger.info(f"✅ Selected ClassX variant stream URL: {resolved_url[:80]}...")
             except Exception as e:
-                logger.debug(f"Direct m3u8 pre-resolve skipped: {e}")
+                logger.debug(f"ClassX m3u8 variant check skipped: {e}")
 
-            return {
-                "url": resolved_url,
-                "keys_string": "",
-                "extra_headers": extra_headers,
-                "media_type": media_type
-            }
+    # ============================================================
+    #  🔥 FIXED: ClassPlus / Akamai Logic (L1 + L2)
+    # ============================================================
+    elif ('classplusapp' in resolved_url or "testbook.com" in resolved_url or 
+          "classplusapp.com/drm" in resolved_url or "media-cdn.classplusapp.com/drm" in resolved_url or 
+          "akamai-cdn.classplusapp.com" in resolved_url):
+        
+        media_type = "ClassPlus / Akamai"
 
         # ---------- EXTRACT contentHashId / contentHashIdl ----------
         content_id = None
@@ -544,6 +495,19 @@ def resolve_media_url(url: str, requested_resolution: Optional[str] = None) -> D
 
         logger.info(f"🔑 ClassPlus content_id: {content_id}")
         logger.info(f"🔑 ClassPlus vidkey: {vidkey}")
+
+        # ---------- CHECK IF IT'S L1 (has key + userIds) ----------
+        is_l1 = 'key=' in resolved_url and 'userIds=' in resolved_url
+        is_l2 = 'hdnts=' in resolved_url and not is_l1
+
+        if is_l1:
+            logger.info("✅ L1 link detected (key + userIds) — preserving all parameters")
+            media_type = "ClassPlus Akamai (L1)"
+        elif is_l2:
+            logger.info("✅ L2 link detected (hdnts only)")
+            media_type = "ClassPlus Akamai (L2)"
+        else:
+            logger.info("ℹ️ Standard / unknown ClassPlus link format")
 
         # ---------- BUILD HEADERS ----------
         headers = {
@@ -592,22 +556,12 @@ def resolve_media_url(url: str, requested_resolution: Optional[str] = None) -> D
                 if ("testbook.com" in base_url or "classplusapp.com/drm" in base_url or 
                     "media-cdn.classplusapp.com/drm" in base_url or '/drm/' in base_url or
                     "akamai-cdn.classplusapp.com" in base_url):
-                    if 'drmUrls' in res:
-                        drm_urls = res.get('drmUrls') or {}
-                        mpd_url = drm_urls.get('manifestUrl') or drm_urls.get('mpdUrl')
-                        lic_url = drm_urls.get('licenseUrl') or drm_urls.get('licUrl')
-                        if mpd_url:
-                            resolved_url = mpd_url
-                            keys = []
-                            if lic_url:
-                                pssh = extract_pssh(mpd_url)
-                                if pssh:
-                                    keys = extract_widevine_keys(pssh, lic_url)
-                            keys_string = " ".join([f"--key {k}" for k in keys]) if keys else ""
-                            media_type = "ClassPlus DRM (MPD)"
-                        else:
-                            resolved_url = res.get("url", base_url)
-                            keys_string = ""
+                    if 'drmUrls' in res and 'manifestUrl' in res['drmUrls']:
+                        mpd_url = res['drmUrls']['manifestUrl']
+                        mpd, keys = get_mps_and_keys(mpd_url)
+                        resolved_url = mpd if (isinstance(mpd, str) and not mpd.startswith('<?xml') and '<MPD' not in mpd) else mpd_url
+                        keys_string = " ".join([f"--key {key}" for key in keys])
+                        media_type = "ClassPlus DRM (MPD)"
                     else:
                         resolved_url = res.get("url", base_url)
                         keys_string = ""
@@ -632,7 +586,7 @@ def resolve_media_url(url: str, requested_resolution: Optional[str] = None) -> D
         extra_headers['Referer'] = 'https://web.classplusapp.com/'
         extra_headers['Origin'] = 'https://web.classplusapp.com'
         extra_headers['x-cdn-tag'] = 'empty'
-        extra_headers['Sec-Fetch-Site'] = 'cross-site'
+        extra_headers['Sec-Fetch-Site'] = 'same-site'
         extra_headers['Sec-Fetch-Mode'] = 'cors'
         extra_headers['Sec-Fetch-Dest'] = 'empty'
 
@@ -658,26 +612,14 @@ def sync_download_worker(task_id: str):
     task["status"] = "downloading"
     task["started_at"] = time.time()
     
-    # Resolve ClassPlus / Akamai / DRM / CloudFront URL
+    # Resolve ClassPlus / Akamai / ClassX / DRM URL
     resolved_info = resolve_media_url(original_url, requested_resolution=resolution)
     target_url = resolved_info["url"]
     keys_string = resolved_info.get("keys_string", "")
-    if task.get("keys"):
-        provided_keys = [k.strip() for k in task["keys"] if k and k.strip()]
-        if provided_keys:
-            keys_string = " ".join([f"--key {k}" for k in provided_keys])
-            task["media_type"] = "ClassPlus DRM (MPD)"
     extra_headers = resolved_info.get("extra_headers", {})
     task["media_type"] = resolved_info.get("media_type", "Standard")
     task["resolved_url"] = target_url
     logger.info(f"Task {task_id}: Resolved link [{task['media_type']}] -> {target_url[:75]}...")
-
-    is_m3u8_stream = (
-        ".m3u8" in target_url or 
-        "timeshift=1" in target_url or 
-        "cloud-front.in" in target_url or
-        "liveclasses" in target_url
-    )
 
     # yt-dlp format selection
     if resolution == "audio":
@@ -693,16 +635,13 @@ def sync_download_worker(task_id: str):
         }]
     else:
         if resolution == "best":
-            format_spec = "best/bestvideo+bestaudio" if is_m3u8_stream else "bestvideo+bestaudio/best"
+            format_spec = "bestvideo+bestaudio/best"
         else:
             try:
                 res_num = int(resolution)
-                if is_m3u8_stream:
-                    format_spec = f"best[height<={res_num}]/bestvideo[height<={res_num}]+bestaudio/best"
-                else:
-                    format_spec = f"bestvideo[height<={res_num}]+bestaudio/best[height<={res_num}]/best"
+                format_spec = f"bestvideo[height<={res_num}]+bestaudio/best[height<={res_num}]/best"
             except ValueError:
-                format_spec = "best/bestvideo+bestaudio" if is_m3u8_stream else "bestvideo+bestaudio/best"
+                format_spec = "bestvideo+bestaudio/best"
 
         outtmpl = str(DOWNLOADS_DIR / f"{task_id}_%(title)s.%(ext)s")
         if custom_name.strip():
@@ -781,50 +720,29 @@ def sync_download_worker(task_id: str):
         'http_headers': browser_headers,       # Full browser identity for every chunk
     }
 
-    if postprocessors:
-        ydl_opts['postprocessors'] = postprocessors
-
-    if "youtube.com" in target_url or "youtu.be" in target_url:
-        ydl_opts['extractor_args'] = {
-            'youtube': {
-                'player_client': ['android', 'web']
-            }
-        }
-        possible_cookie_paths = [
-            COOKIES_FILE,
-            str(BASE_DIR / "youtube_cookies.txt"),
-            str(BASE_DIR / "cookies.txt"),
-            str(BASE_DIR.parent / "Banana_bot--main" / "youtube_cookies.txt"),
-            str(BASE_DIR / "website" / "youtube_cookies.txt")
-        ]
-        for cp in possible_cookie_paths:
-            if cp and Path(cp).exists():
-                ydl_opts['cookiefile'] = cp
-                logger.info(f"Using YouTube cookies from: {cp}")
-                break
-
-    if is_m3u8_stream:
-        ydl_opts['hls_use_mpegts'] = True
-        ydl_opts['live_from_start'] = True
-
-    is_akamai_stream = (
-        "akamai-cdn.classplusapp.com" in target_url or
-        "hdnts=" in target_url or
-        "hdntl=" in target_url or
-        "classplusapp" in target_url
+    # ClassX Google Edge Cache stream optimizations
+    is_classx_stream = (
+        "classx.co.in" in target_url or
+        "transcoded-videos.classx" in target_url or
+        task.get("media_type") == "ClassX Stream"
     )
-    if is_akamai_stream:
-        # Akamai CDN rate limits or drops connections when concurrency is too high; 4 parallel fragments is optimal
-        ydl_opts['concurrent_fragment_downloads'] = 4
-        # Propagate hdnts / hdntl token across variant playlists, chunks, and AES key requests
-        tok_m = re.search(r'[?&](hdnt[sl]=[^&]+)', target_url)
+    if is_classx_stream:
+        ydl_opts['concurrent_fragment_downloads'] = 16
+        ydl_opts['buffersize'] = 32 * 1024 * 1024
+        ydl_opts['http_chunk_size'] = 10 * 1024 * 1024
+        tok_m = re.search(r'[?&](edge-cache-token=[^&]+)', target_url)
         if tok_m:
             tok_str = tok_m.group(1)
             ydl_opts.setdefault('extractor_args', {})['generic'] = {
                 'fragment_query': [tok_str],
-                'variant_query': [tok_str],
-                'key_query': [tok_str]
+                'variant_query': [tok_str]
             }
+
+    if postprocessors:
+        ydl_opts['postprocessors'] = postprocessors
+
+    if Path(COOKIES_FILE).exists() and ("youtube.com" in target_url or "youtu.be" in target_url):
+        ydl_opts['cookiefile'] = COOKIES_FILE
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -836,49 +754,23 @@ def sync_download_worker(task_id: str):
                 logger.warning(f"Metadata extraction fallback for {task_id}: {e}")
                 extracted_title = custom_name.strip() or f"Video_{task_id}"
 
-            # If title is generic (e.g. 'master', 'index', 'Video'), extract clean identifier from Akamai path
+            # If title is generic (e.g. 'master', 'index', 'Video'), extract clean identifier from Akamai / ClassX path
             if (not extracted_title or extracted_title.lower() in ["master", "index", "playlist", "video"]):
                 m_media = re.search(r'/media/(\d+)/[^/]+/([a-zA-Z0-9]+)/', target_url)
+                m_classx = re.search(r'/videos/([a-zA-Z0-9_\-]+?)(?:-data)?/([0-9\-]+)/', target_url)
                 if m_media:
                     extracted_title = f"ClassPlus_{m_media.group(1)}_{m_media.group(2)}"
+                elif m_classx:
+                    tenant_clean = m_classx.group(1).replace("onlinetutoria", "")
+                    content_clean = m_classx.group(2).split("-")[0]
+                    extracted_title = f"ClassX_{tenant_clean}_{content_clean}"
                 else:
-                    extracted_title = f"ClassPlus_{task_id}" if is_akamai_stream else f"Video_{task_id}"
+                    extracted_title = f"ClassX_{task_id}" if is_classx_stream else f"Video_{task_id}"
 
             task["display_title"] = custom_name.strip() if custom_name.strip() else extracted_title
 
-            # Perform download with automatic FFmpeg fallback for HLS/Timeshift
-            try:
-                ydl.download([target_url])
-            except Exception as dl_err:
-                logger.warning(f"yt-dlp download attempt error for {task_id}: {dl_err}")
-                ffmpeg_bin = shutil.which("ffmpeg")
-                if is_m3u8_stream and ffmpeg_bin:
-                    logger.info(f"Task {task_id}: Falling back to FFmpeg native HLS capture...")
-                    task["speed_str"] = "Downloading with FFmpeg..."
-                    fallback_prefix = "ClassPlus" if is_akamai_stream else "LiveClass"
-                    fallback_title = sanitize_filename(task.get("display_title") or f"{fallback_prefix}_{task_id}")
-                    fallback_file = DOWNLOADS_DIR / f"{task_id}_{fallback_title}.mp4"
-                    
-                    hdr_lines = "".join([f"{k}: {v}\r\n" for k, v in browser_headers.items()])
-                    ffmpeg_cmd = [
-                        ffmpeg_bin,
-                        "-y",
-                        "-headers", hdr_lines,
-                        "-i", target_url,
-                        "-c", "copy",
-                        "-bsf:a", "aac_adtstoasc",
-                        "-movflags", "+faststart",
-                        str(fallback_file)
-                    ]
-                    logger.info(f"Running FFmpeg: {' '.join(ffmpeg_cmd[:6])}...")
-                    proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=3600)
-                    if proc.returncode == 0 and fallback_file.exists() and fallback_file.stat().st_size > 1000:
-                        logger.info(f"Task {task_id}: FFmpeg download completed successfully -> {fallback_file}")
-                    else:
-                        logger.error(f"FFmpeg error: {proc.stderr[:300]}")
-                        raise dl_err
-                else:
-                    raise dl_err
+            # Perform download
+            ydl.download([target_url])
 
         # Decrypt DRM if keys_string exists and mp4decrypt is available
         if keys_string and '--key' in keys_string:
@@ -910,10 +802,6 @@ def sync_download_worker(task_id: str):
             task["filesize_str"] = format_bytes(final_file.stat().st_size)
             task["download_url"] = f"/api/files/{task_id}"
 
-            # Clean display title if currently a raw URL or empty
-            if not task.get("custom_name") and (not task.get("display_title") or str(task.get("display_title")).startswith("http")):
-                task["display_title"] = Path(friendly_name).stem
-
             # Auto-upload to YouTube if enabled
             if task.get("upload_to_youtube"):
                 task["status"] = "uploading"
@@ -930,7 +818,7 @@ def sync_download_worker(task_id: str):
                     yt_res = upload_video_to_youtube(
                         file_path=str(final_file),
                         title=yt_title,
-                        description="",
+                        description=f"Auto-downloaded & uploaded via OmniStream\nOriginal Source: {original_url}",
                         privacy_status=task.get("privacy_status", "unlisted"),
                         progress_callback=yt_progress,
                         user_id=task.get("user_id")
@@ -958,23 +846,7 @@ def sync_download_worker(task_id: str):
                     task["progress"] = pct
                     task["speed_str"] = f"TG: {pct}% ({spd_str})"
 
-                # Determine clean video name and title (never a raw URL or task_id hash)
-                clean_title = (task.get("custom_name") or "").strip()
-                if not clean_title:
-                    disp = (task.get("display_title") or "").strip()
-                    if disp and not disp.startswith("http://") and not disp.startswith("https://"):
-                        clean_title = disp
-                if not clean_title:
-                    clean_title = friendly_name
-                clean_title = re.sub(r'^[a-zA-Z0-9]{8}_', '', clean_title).strip()
-                title_stem = Path(clean_title).stem if "." in clean_title else clean_title
-                if not title_stem:
-                    title_stem = "Video"
-
-                ext = final_file.suffix or ".mp4"
-                video_filename = f"{title_stem}{ext}"
-                caption_text = f"**{title_stem}**"
-
+                tg_title = task.get("display_title") or friendly_name
                 bot_token = task.get("tg_bot_token") or os.environ.get("TG_BOT_TOKEN")
                 api_id = task.get("tg_api_id") or os.environ.get("TG_API_ID")
                 api_hash = task.get("tg_api_hash") or os.environ.get("TG_API_HASH")
@@ -982,10 +854,10 @@ def sync_download_worker(task_id: str):
 
                 if TELEGRAM_UPLOADER_AVAILABLE and bot_token and api_id and api_hash and chat_id:
                     try:
+                        caption_text = f"🎬 **{tg_title}**\n\n🔗 Source: {original_url}"
                         tg_res = asyncio.run(upload_video_to_telegram(
                             file_path=str(final_file),
                             caption=caption_text,
-                            file_name=video_filename,
                             bot_token=bot_token,
                             api_id=api_id,
                             api_hash=api_hash,
@@ -1067,24 +939,19 @@ def create_task_entry(
     tg_bot_token: Optional[str] = None,
     tg_api_id: Optional[str] = None,
     tg_api_hash: Optional[str] = None,
-    tg_chat_id: Optional[str] = None,
-    keys: Optional[List[str]] = None
+    tg_chat_id: Optional[str] = None
 ) -> str:
     task_id = str(uuid.uuid4())[:8]
-    is_cp = any(k in url.lower() for k in ["classplusapp", "testbook.com", "akamai", "media-cdn", "hdnts=", "hdntl="])
-    is_live_hls = any(k in url.lower() for k in ["cloud-front.in", "liveclasses", "timeshift=1", "txcodectempname", "starttime_epoch"])
-    initial_media_type = "ClassPlus / Akamai" if is_cp else ("Live Classes / Timeshift" if is_live_hls else "Standard")
-    if keys:
-        initial_media_type = "ClassPlus DRM (MPD)"
+    is_cp = any(k in url.lower() for k in ["classplusapp", "testbook.com", "akamai", "media-cdn"])
+    is_classx = any(k in url.lower() for k in ["classx.co.in", "transcoded-videos.classx"])
     tasks_db[task_id] = {
         "id": task_id,
         "url": url.strip(),
         "custom_name": custom_name.strip() if custom_name else "",
         "display_title": custom_name.strip() if custom_name else url.strip(),
         "resolution": resolution,
-        "media_type": initial_media_type,
+        "media_type": "ClassPlus / Akamai" if is_cp else ("ClassX Stream" if is_classx else "Standard"),
         "resolved_url": None,
-        "keys": keys or [],
         "upload_to_youtube": upload_to_youtube,
         "privacy_status": privacy_status,
         "user_id": user_id,
@@ -1141,7 +1008,7 @@ def background_yt_upload(task_id: str):
         yt_res = upload_video_to_youtube(
             file_path=file_path,
             title=yt_title,
-            description="",
+            description=f"Auto-downloaded & uploaded via OmniStream\nOriginal Source: {task.get('url', '')}",
             privacy_status=task.get("privacy_status", "unlisted"),
             progress_callback=yt_progress,
             user_id=task.get("user_id")
@@ -1177,23 +1044,7 @@ def background_tg_upload(task_id: str):
         task["progress"] = pct
         task["speed_str"] = f"TG: {pct}% ({spd_str})"
 
-    # Determine clean video name and title (never a raw URL or task_id hash)
-    clean_title = (task.get("custom_name") or "").strip()
-    if not clean_title:
-        disp = (task.get("display_title") or "").strip()
-        if disp and not disp.startswith("http://") and not disp.startswith("https://"):
-            clean_title = disp
-    if not clean_title:
-        clean_title = task.get("friendly_filename") or Path(file_path).stem
-    clean_title = re.sub(r'^[a-zA-Z0-9]{8}_', '', clean_title).strip()
-    title_stem = Path(clean_title).stem if "." in clean_title else clean_title
-    if not title_stem:
-        title_stem = "Video"
-
-    ext = Path(file_path).suffix or ".mp4"
-    video_filename = f"{title_stem}{ext}"
-    caption_text = f"**{title_stem}**"
-
+    tg_title = task.get("display_title") or task.get("friendly_filename") or "Uploaded Video"
     bot_token = task.get("tg_bot_token") or os.environ.get("TG_BOT_TOKEN")
     api_id = task.get("tg_api_id") or os.environ.get("TG_API_ID")
     api_hash = task.get("tg_api_hash") or os.environ.get("TG_API_HASH")
@@ -1201,10 +1052,10 @@ def background_tg_upload(task_id: str):
 
     if TELEGRAM_UPLOADER_AVAILABLE and bot_token and api_id and api_hash and chat_id:
         try:
+            caption_text = f"🎬 **{tg_title}**\n\n🔗 Source: {task.get('url', '')}"
             tg_res = asyncio.run(upload_video_to_telegram(
                 file_path=file_path,
                 caption=caption_text,
-                file_name=video_filename,
                 bot_token=bot_token,
                 api_id=api_id,
                 api_hash=api_hash,
@@ -1363,210 +1214,6 @@ async def manual_telegram_upload(
     return {"success": True, "message": "Telegram upload started in background"}
 
 
-# =========================================================================
-#  Classplus Stream Signer & Widevine DRM Extraction (ITSGOLU Engine)
-# =========================================================================
-
-DEFAULT_CP_HEADERS = {
-    'host': 'api.classplusapp.com',
-    'accept-language': 'en',
-    'api-version': '56',
-    'app-version': '1.12.1.1',
-    'build-number': '56',
-    'connection': 'Keep-Alive',
-    'content-type': 'application/json',
-    'device-details': 'motorola_Moto G4_SDK-32',
-    'device-id': 'c28d3cb16bbdac01',
-    'region': 'IN',
-    'user-agent': 'Mobile-Android',
-    'accept-encoding': 'gzip'
-}
-
-
-def extract_pssh(mpd_url: str) -> Optional[str]:
-    try:
-        resp = requests.get(mpd_url, timeout=12)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-        for elem in root.iter():
-            if 'ContentProtection' in elem.tag:
-                scheme = elem.get('schemeIdUri', '').lower()
-                if 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed' in scheme:
-                    for child in elem:
-                        if 'pssh' in child.tag.lower() and child.text:
-                            return child.text.strip()
-    except Exception as err:
-        logger.warning(f"Error parsing MPD for PSSH: {err}")
-    return None
-
-
-def extract_widevine_keys(pssh_b64: str, lic_url: str) -> List[str]:
-    if not WIDEVINE_ENABLED:
-        logger.warning("pywidevine not installed; cannot extract DRM keys.")
-        return []
-
-    wvd_files = (
-        glob.glob(str(BASE_DIR / 'WVDs' / '*.wvd')) or 
-        glob.glob(str(BASE_DIR / '*.wvd')) or
-        glob.glob(str(BASE_DIR.parent / 'WVDs' / '*.wvd')) or
-        glob.glob('WVDs/*.wvd') or
-        glob.glob('./*.wvd')
-    )
-    if not wvd_files:
-        logger.warning("No .wvd file found for Widevine decryption.")
-        return []
-
-    try:
-        device = Device.load(wvd_files[0])
-        cdm = Cdm.from_device(device)
-        session_id = cdm.open()
-
-        challenge = cdm.get_license_challenge(session_id, PSSH(pssh_b64))
-        lic_resp = requests.post(
-            lic_url,
-            data=challenge,
-            headers={
-                'user-agent': 'okhttp/4.9.3',
-                'content-type': 'application/octet-stream'
-            },
-            timeout=15
-        )
-        lic_resp.raise_for_status()
-
-        cdm.parse_license(session_id, lic_resp.content)
-        keys = [f"{k.kid.hex}:{k.key.hex()}" for k in cdm.get_keys(session_id) if k.type == 'CONTENT']
-        cdm.close(session_id)
-        return keys
-    except Exception as err:
-        logger.warning(f"Widevine key extraction failed: {err}")
-        return []
-
-
-@app.get("/itsgolu")
-@app.get("/api/classplus/sign")
-def itsgolu_signer(
-    url: str = Query(..., description="Target Classplus stream URL / content ID"),
-    token: Optional[str] = Query(None, description="x-access-token"),
-    orgCode: Optional[str] = Query(None, description="Optional Org Code")
-):
-    headers = DEFAULT_CP_HEADERS.copy()
-    if isinstance(token, str) and token.strip() and token != "/d":
-        headers["x-access-token"] = token.strip()
-    elif CP_TOKEN and isinstance(CP_TOKEN, str) and CP_TOKEN.strip():
-        headers["x-access-token"] = CP_TOKEN.strip()
-    if isinstance(orgCode, str) and orgCode.strip():
-        headers["orgCode"] = orgCode.strip()
-
-    clean_url = url.replace("https://cpvod.testbook.com/", "https://media-cdn.classplusapp.com/drm/")
-    clean_url = clean_url.replace("https://tencdn.classplusapp.com/", "https://media-cdn.classplusapp.com/tencent/")
-
-    sign_api = "https://api.classplusapp.com/cams/uploader/video/jw-signed-url"
-    params = {"contentId": clean_url, "offlineDownload": "false"} if not clean_url.startswith("http") else {"url": clean_url}
-
-    try:
-        resp = requests.get(sign_api, params=params, headers=headers, timeout=20)
-        data = resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Classplus API communication error: {e}")
-
-    signed_url = data.get("url") or (data.get("data") or {}).get("url")
-    drm_urls = data.get("drmUrls") or (data.get("data") or {}).get("drmUrls")
-
-    if signed_url:
-        return {
-            "success": True,
-            "url": signed_url
-        }
-
-    if drm_urls:
-        mpd_url = drm_urls.get("manifestUrl") or drm_urls.get("mpdUrl")
-        lic_url = drm_urls.get("licenseUrl") or drm_urls.get("licUrl")
-        
-        keys = []
-        if mpd_url and lic_url:
-            pssh = extract_pssh(mpd_url)
-            if pssh:
-                keys = extract_widevine_keys(pssh, lic_url)
-
-        return {
-            "success": True,
-            "MPD": mpd_url,
-            "KEYS": keys,
-            "lic_url": lic_url
-        }
-
-    return JSONResponse(
-        status_code=400,
-        content={"success": False, "message": "Failed to sign URL", "raw_response": data}
-    )
-
-
-@app.get("/get_keys")
-def get_keys_endpoint(
-    mpd_url: str = Query(..., description="MPD manifest URL"),
-    lic_url: str = Query(..., description="License acquisition URL")
-):
-    pssh = extract_pssh(mpd_url)
-    if not pssh:
-        raise HTTPException(status_code=400, detail="PSSH box missing in MPD manifest")
-
-    keys = extract_widevine_keys(pssh, lic_url)
-    if not keys:
-        raise HTTPException(status_code=500, detail="Key acquisition failed from license server")
-
-    return {
-        "mpd": mpd_url,
-        "keys": keys
-    }
-
-
-@app.get("/download")
-def download_stream(
-    url: str = Query(..., description="Target file URL to download"),
-    filename: Optional[str] = Query("classplus_video.mp4", description="Output filename")
-):
-    """
-    Proxy download endpoint streaming files with Content-Disposition attachment header.
-    """
-    try:
-        req = requests.get(url, stream=True, timeout=30)
-        req.raise_for_status()
-
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        }
-        content_type = req.headers.get("content-type", "application/octet-stream")
-        content_length = req.headers.get("content-length")
-        if content_length:
-            headers["Content-Length"] = content_length
-
-        def stream_chunks():
-            for chunk in req.iter_content(chunk_size=1024 * 128):
-                if chunk:
-                    yield chunk
-
-        return StreamingResponse(stream_chunks(), media_type=content_type, headers=headers)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download streaming error: {e}")
-
-
-@app.get("/health")
-@app.get("/api/health")
-def check_health():
-    wvd_found = bool(
-        glob.glob(str(BASE_DIR / 'WVDs' / '*.wvd')) or 
-        glob.glob(str(BASE_DIR / '*.wvd')) or
-        glob.glob(str(BASE_DIR.parent / 'WVDs' / '*.wvd')) or
-        glob.glob('WVDs/*.wvd') or
-        glob.glob('./*.wvd')
-    )
-    return {
-        "status": "online",
-        "pywidevine_installed": WIDEVINE_ENABLED,
-        "wvd_device_loaded": wvd_found
-    }
-
-
 @app.post("/api/download/single")
 async def download_single(req: SingleDownloadRequest):
     url = req.url.strip()
@@ -1584,8 +1231,7 @@ async def download_single(req: SingleDownloadRequest):
         tg_bot_token=req.tg_bot_token,
         tg_api_id=req.tg_api_id,
         tg_api_hash=req.tg_api_hash,
-        tg_chat_id=req.tg_chat_id,
-        keys=req.keys
+        tg_chat_id=req.tg_chat_id
     )
     await download_queue.put(task_id)
     return {"success": True, "task": tasks_db[task_id]}
